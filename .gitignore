@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# PaddleOCR / PaddleX downloaded model cache & outputs
+.paddlex/
+output/
+*.log
+
+# OS / editor / tooling
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+# local launch.json uses machine-specific absolute paths
+.claude/

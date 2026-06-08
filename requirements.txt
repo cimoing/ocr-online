@@ -1,0 +1,13 @@
+# PP-OCRv5 online OCR service
+# CPU build of PaddlePaddle (GTX 960 / compute 5.2 is below modern Paddle GPU wheels).
+# Pin 3.2.2: paddlepaddle 3.3.x has an oneDNN+PIR regression that crashes PP-OCRv5
+# CPU inference (ConvertPirAttribute2RuntimeAttribute). 3.2.2 keeps MKLDNN working,
+# which is ~10x faster than the native CPU kernels.
+paddlepaddle==3.2.2
+paddleocr>=3.1.0
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+pillow>=10.0.0
+numpy>=1.24
