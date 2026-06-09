@@ -23,10 +23,10 @@ d.text((120, 90), "PP-OCRv5 高清扫描件识别基准", fill="black", font=_fo
 
 bodies = [
     "本文档用于评估高清扫描件场景下的检测与识别性能。",
-    "PaddleOCR provides PP-OCRv5 server and mobile models.",
+    "PP-OCRv5 mobile ONNX runs directly in the browser.",
     "识别结果按原图坐标叠加渲染，文字可选中、可复制。",
     "数字与符号 0123456789 +-*/=%@#& （括号）《书名号》。",
-    "服务端模型精度更高，移动端模型速度更快，可一键切换对比。",
+    "浏览器端模型完成检测与识别，无需服务端 OCR。",
     "The quick brown fox jumps over the lazy dog. 1234567890",
     "仅面向高清扫描件，不支持手写、拍照与旋转文本。",
     "检测默认将长边缩放到 960 像素后再做推理。",

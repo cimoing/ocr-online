@@ -7,10 +7,24 @@ env/
 *.egg-info/
 .pytest_cache/
 
-# PaddleOCR / PaddleX downloaded model cache & outputs
+# Node / Vite
+node_modules/
+dist/
+.tmp/
+
+# Downloaded model cache & outputs
 .paddlex/
 output/
 *.log
+
+# Scratch dir for ONNX conversion/verification (shipped copies live in static/models)
+build/
+
+# In-browser OCR binaries — fetched by scripts/fetch_browser_assets.py, not committed
+# (mirrors how PaddleOCR weights are downloaded rather than checked in).
+# The small character dictionary (static/models/ppocrv5_keys.txt) IS committed.
+static/models/*.onnx
+static/vendor/
 
 # OS / editor / tooling
 .DS_Store

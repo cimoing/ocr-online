@@ -22,7 +22,7 @@ img = Image.new("RGB", (820, 360), "white")
 d = ImageDraw.Draw(img)
 lines = [
     ("PP-OCRv5 在线 OCR 测试", 40),
-    ("服务端与移动端模型对比", 34),
+    ("浏览器端 PP-OCRv5 识别", 34),
     ("Hello, PaddleOCR! 1234567890", 32),
     ("识别结果按位置渲染，可复制。", 30),
 ]
