@@ -273,7 +273,7 @@ export default {
 
           const script = document.createElement("script");
           script.type = "module";
-          script.src = "/ocr-local.js?v=3";
+          script.src = `${import.meta.env.BASE_URL}ocr-local.js?v=3`;
           script.dataset.ocrLocal = "true";
           script.addEventListener("load", resolve, { once: true });
           script.addEventListener("error", () => reject(new Error("本地推理模块加载失败")), { once: true });

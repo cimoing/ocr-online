@@ -48,6 +48,23 @@ npm run preview
 
 也可以把 `dist/` 部署到 Nginx、静态文件服务器、对象存储或前端托管平台。
 
+## GitHub Pages
+
+仓库内置 GitHub Actions 工作流：`.github/workflows/deploy-pages.yml`。推送到 `master` 或 `main` 后会自动：
+
+1. 安装依赖
+2. 下载并校验 OCR 模型与 WASM 运行时
+3. 执行 `npm run build`
+4. 发布 `dist/` 到 GitHub Pages
+
+站点按项目页子路径构建，访问路径为：
+
+```text
+https://cimoing.github.io/ocr-online/
+```
+
+GitHub 仓库 Settings -> Pages 中需要选择 **GitHub Actions** 作为发布来源。
+
 ## 本地开发
 
 ```powershell
