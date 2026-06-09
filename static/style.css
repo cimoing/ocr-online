@@ -165,6 +165,81 @@ body {
   background: #fff;
   z-index: 5;
 }
+.ocr-tip {
+  position: fixed;
+  z-index: 50;
+  pointer-events: none;
+  background: #0f172a;
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  padding: 6px 9px;
+  border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+  white-space: nowrap;
+}
+.ocr-tip[hidden] { display: none; }
+
+/* ---------- fine-tune region edit mode ---------- */
+.btn.active { background: var(--accent); color: #fff; font-weight: 600; }
+.overlay.edit { cursor: crosshair; }
+.overlay.edit .ocr-box {
+  cursor: move;
+  overflow: visible;            /* let handles / ✕ show outside the box */
+  border-color: var(--accent);
+  background: rgba(255, 255, 255, 0.35);
+}
+.overlay.edit .ocr-box .txt { user-select: none; }
+.overlay.edit .ocr-box.selected { outline: 2px solid var(--accent-700); z-index: 6; }
+.ocr-box.recognizing { opacity: 0.55; outline: 2px dashed var(--accent); }
+
+.handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  background: #fff;
+  border: 1.5px solid var(--accent);
+  border-radius: 2px;
+  z-index: 7;
+}
+.h-nw { top: -5px; left: -5px; cursor: nwse-resize; }
+.h-n  { top: -5px; left: 50%; margin-left: -5px; cursor: ns-resize; }
+.h-ne { top: -5px; right: -5px; cursor: nesw-resize; }
+.h-e  { top: 50%; right: -5px; margin-top: -5px; cursor: ew-resize; }
+.h-se { bottom: -5px; right: -5px; cursor: nwse-resize; }
+.h-s  { bottom: -5px; left: 50%; margin-left: -5px; cursor: ns-resize; }
+.h-sw { bottom: -5px; left: -5px; cursor: nesw-resize; }
+.h-w  { top: 50%; left: -5px; margin-top: -5px; cursor: ew-resize; }
+
+.del-btn {
+  position: absolute;
+  top: -11px;
+  right: -11px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: #dc2626;
+  color: #fff;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  z-index: 8;
+}
+.del-btn:hover { background: #b91c1c; }
+
+.rubber {
+  position: absolute;
+  border: 1.5px dashed var(--accent);
+  background: rgba(37, 99, 235, 0.12);
+  z-index: 9;
+  pointer-events: none;
+}
 
 /* ---------- status bar ---------- */
 .statusbar {

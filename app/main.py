@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from starlette.concurrency import run_in_threadpool
 
-from .ocr_service import recognize
+from .ocr_service import recognize, recognize_text
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
@@ -63,4 +63,34 @@ async def api_ocr(image: UploadFile = File(...), model: str = Form("mobile")) ->
         "count": len(result["items"]),
         "items": result["items"],
         "timings": timings,
+    }
+
+
+@app.post("/api/ocr_region")
+async def api_ocr_region(
+    image: UploadFile = File(...), model: str = Form("mobile")
+) -> dict:
+    """Recognize a single cropped region (the "fine-tune region" feature).
+
+    The frontend crops the adjusted/drawn box out of the original-resolution
+    image and posts just that patch; we run OCR on it and return the text only.
+    """
+    if model not in ("server", "mobile"):
+        raise HTTPException(status_code=400, detail="model must be 'server' or 'mobile'")
+
+    raw = await image.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty upload")
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid image file")
+
+    result = await run_in_threadpool(recognize_text, img, model)
+    return {
+        "model": model,
+        "text": result["text"],
+        "score": result["score"],
+        "timings": result["timings"],
     }
