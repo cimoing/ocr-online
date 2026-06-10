@@ -1,17 +1,22 @@
 // In-browser PP-OCRv5 (mobile) via onnxruntime-web.
 //
-// Everything runs client-side: det.onnx + rec.onnx are fetched once and cached
-// by the browser; there is no OCR API round-trip.
+// Everything runs client-side: det/rec/cls ONNX models are fetched once,
+// persisted in Cache Storage, and executed in wasm; there is no OCR API
+// round-trip.
 //
 // Exposes window.LocalOCR with a stable {width,height,items[]} result shape so
 // the Vue overlay / copy / fine-tune UI can consume it directly.
 import * as ort from "./vendor/ort/ort.wasm.bundle.min.mjs?v=1";
 
-// Single-threaded wasm: avoids the SharedArrayBuffer / COOP+COEP requirement
-// while still using SIMD. `proxy` moves session.run into a worker so heavy
-// inference never blocks the UI thread.
+// `proxy` moves session.run into a worker so heavy inference never blocks the
+// UI thread. Threads need SharedArrayBuffer, i.e. crossOriginIsolated — true
+// in dev via vite server headers and on Pages via coi-serviceworker; when
+// isolation is missing we degrade to single-threaded SIMD wasm.
 ort.env.wasm.wasmPaths = new URL("./vendor/ort/", import.meta.url).href;
-ort.env.wasm.numThreads = 1;
+ort.env.wasm.numThreads =
+  typeof crossOriginIsolated !== "undefined" && crossOriginIsolated
+    ? Math.min(4, Math.max(1, navigator.hardwareConcurrency || 1))
+    : 1;
 ort.env.wasm.proxy = true;
 
 const MODELS = {
@@ -34,6 +39,7 @@ const DET_UNCLIP = 1.5;
 const DET_MIN_SIZE = 3; // reject boxes whose short side is below this (map px)
 
 const REC_H = 48; // recognition input height (image_shape [3,48,*])
+const REC_BATCH = 8; // crops per rec run, sorted by width and zero-padded
 // Engine-level floor only rejects garbage; the UI filters further with a
 // user-adjustable threshold so borderline-but-correct lines aren't lost.
 const REC_SCORE_FLOOR = 0.3;
@@ -43,6 +49,7 @@ const REC_SCORE_FLOOR = 0.3;
 // normalization, softmax over ['0_degree','180_degree'] (per its inference.yml).
 const CLS_W = 160;
 const CLS_H = 80;
+const CLS_BATCH = 8;
 // PaddleX flips on bare argmax; a mild margin avoids flipping upright lines
 // on coin-toss outputs while still catching genuinely inverted text.
 const CLS_THRESH = 0.6;
@@ -53,24 +60,54 @@ let _initPromise = null;
 let _onProgress = () => {};
 
 // ---------- model loading ----------
+// Bump when any entry in MODELS (or the ort wasm) changes content, otherwise
+// returning visitors keep using the previously cached bytes forever.
+const ASSET_CACHE = "ppocr-assets-v1";
+
+async function openAssetCache() {
+  try {
+    if (typeof caches === "undefined") return null;
+    return await caches.open(ASSET_CACHE);
+  } catch (_) {
+    return null; // non-secure context / storage disabled
+  }
+}
+
 async function fetchBuffer(url, label) {
+  const cache = await openAssetCache();
+  if (cache) {
+    try {
+      const hit = await cache.match(url);
+      if (hit) {
+        _onProgress(`${label}（本地缓存）`);
+        return new Uint8Array(await hit.arrayBuffer());
+      }
+    } catch (_) {}
+  }
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`下载失败 ${label}: HTTP ${resp.status}`);
   const total = +resp.headers.get("content-length") || 0;
-  if (!resp.body || !total) return new Uint8Array(await resp.arrayBuffer());
-  const reader = resp.body.getReader();
-  const chunks = [];
-  let got = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    got += value.length;
-    _onProgress(`${label} ${(got / 1048576).toFixed(1)}/${(total / 1048576).toFixed(1)}MB`);
+  let out;
+  if (!resp.body || !total) {
+    out = new Uint8Array(await resp.arrayBuffer());
+  } else {
+    const reader = resp.body.getReader();
+    const chunks = [];
+    let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      got += value.length;
+      _onProgress(`${label} ${(got / 1048576).toFixed(1)}/${(total / 1048576).toFixed(1)}MB`);
+    }
+    out = new Uint8Array(got);
+    let off = 0;
+    for (const c of chunks) { out.set(c, off); off += c.length; }
   }
-  const out = new Uint8Array(got);
-  let off = 0;
-  for (const c of chunks) { out.set(c, off); off += c.length; }
+  if (cache) {
+    try { await cache.put(url, new Response(out)); } catch (_) {}
+  }
   return out;
 }
 
@@ -83,8 +120,8 @@ function init() {
     _onProgress("下载识别模型…");
     const recBuf = await fetchBuffer(MODELS.rec, "识别模型");
     _onProgress("加载字典…");
-    const keysTxt = await (await fetch(MODELS.keys)).text();
-    const keys = keysTxt.replace(/\n$/, "").split("\n");
+    const keysBuf = await fetchBuffer(MODELS.keys, "字典");
+    const keys = new TextDecoder().decode(keysBuf).replace(/\n$/, "").split("\n");
     _classes = ["<blank>", ...keys, " "]; // CTC: blank + dict + space
     _onProgress("初始化推理引擎…");
     const det = await ort.InferenceSession.create(detBuf, opts);
@@ -116,10 +153,10 @@ function drawScaled(source, sx, sy, sw, sh, dw, dh) {
   _cv.height = dh;
   _ctx.clearRect(0, 0, dw, dh);
   _ctx.drawImage(source, sx, sy, sw, sh, 0, 0, dw, dh);
-  return _ctx.getImageData(0, 0, dw, dh).data; // RGBA
+  return _ctx.getImageData(0, 0, dw, dh).data; // RGBA (fresh copy)
 }
 
-// dedicated scratch for rotated line crops (recPreprocess reuses _cv)
+// dedicated scratch for rotated line crops (drawScaled reuses _cv)
 const _cropCv = document.createElement("canvas");
 const _cropCtx = _cropCv.getContext("2d", { willReadFrequently: true });
 
@@ -318,58 +355,63 @@ function cropPoly(source, poly) {
   return _cropCv;
 }
 
-// ---------- orientation classifier ----------
-function clsPreprocess(canvas) {
-  const rgba = drawScaled(canvas, 0, 0, canvas.width, canvas.height, CLS_W, CLS_H);
-  const data = new Float32Array(3 * CLS_H * CLS_W);
+// ---------- batched line recognition (cls -> rec) ----------
+// 180° rotation of an RGBA buffer == reversing its pixel order; doing it on
+// the already-resized rec input avoids keeping per-line crop canvases alive.
+function flip180(rgba) {
+  for (let a = 0, b = rgba.length - 4; a < b; a += 4, b -= 4) {
+    for (let k = 0; k < 4; k++) {
+      const t = rgba[a + k];
+      rgba[a + k] = rgba[b + k];
+      rgba[b + k] = t;
+    }
+  }
+}
+
+// Run cls on every line (chunked); flag lines the classifier wants flipped.
+async function clsFlags(lines) {
+  const flags = new Array(lines.length).fill(false);
+  if (!_sessions.cls) return flags;
+  const todo = lines.map((l, i) => (l ? i : -1)).filter((i) => i >= 0);
   const plane = CLS_H * CLS_W;
-  for (let i = 0, p = 0; p < plane; p++, i += 4) {
-    // RGB order with ImageNet stats (classification heads differ from det/rec)
-    data[p] = (rgba[i] / 255 - DET_MEAN[0]) / DET_STD[0];
-    data[plane + p] = (rgba[i + 1] / 255 - DET_MEAN[1]) / DET_STD[1];
-    data[2 * plane + p] = (rgba[i + 2] / 255 - DET_MEAN[2]) / DET_STD[2];
+  for (let off = 0; off < todo.length; off += CLS_BATCH) {
+    const chunk = todo.slice(off, off + CLS_BATCH);
+    const run = async (idxs) => {
+      const n = idxs.length;
+      const data = new Float32Array(n * 3 * plane);
+      idxs.forEach((lineIdx, j) => {
+        const rgba = lines[lineIdx].clsRgba;
+        const base = j * 3 * plane;
+        for (let i = 0, p = 0; p < plane; p++, i += 4) {
+          // RGB order with ImageNet stats (classification heads differ from det/rec)
+          data[base + p] = (rgba[i] / 255 - DET_MEAN[0]) / DET_STD[0];
+          data[base + plane + p] = (rgba[i + 1] / 255 - DET_MEAN[1]) / DET_STD[1];
+          data[base + 2 * plane + p] = (rgba[i + 2] / 255 - DET_MEAN[2]) / DET_STD[2];
+        }
+      });
+      const out = await runSession(_sessions.cls, new ort.Tensor("float32", data, [n, 3, CLS_H, CLS_W]));
+      const o = out[_sessions.cls.outputNames[0]].data; // [n,2] softmax ['0','180']
+      idxs.forEach((lineIdx, j) => {
+        const p0 = o[j * 2], p180 = o[j * 2 + 1];
+        if (p180 > p0 && p180 >= CLS_THRESH) flags[lineIdx] = true;
+      });
+    };
+    try {
+      await run(chunk);
+    } catch (err) {
+      if (chunk.length === 1) throw err;
+      for (const i of chunk) await run([i]); // model may reject batches
+    }
   }
-  return new ort.Tensor("float32", data, [1, 3, CLS_H, CLS_W]);
+  return flags;
 }
 
-async function clsMaybeFlip(canvas) {
-  if (!_sessions.cls) return canvas;
-  const out = await runSession(_sessions.cls, clsPreprocess(canvas));
-  const o = out[_sessions.cls.outputNames[0]].data; // softmax over ['0','180']
-  if (o[1] > o[0] && o[1] >= CLS_THRESH) {
-    const f = document.createElement("canvas");
-    f.width = canvas.width;
-    f.height = canvas.height;
-    const ctx = f.getContext("2d");
-    ctx.translate(f.width, f.height);
-    ctx.rotate(Math.PI);
-    ctx.drawImage(canvas, 0, 0);
-    return f;
-  }
-  return canvas;
-}
-
-// ---------- recognition ----------
-function recPreprocess(canvas) {
-  const rw = Math.max(1, Math.round((REC_H * canvas.width) / canvas.height));
-  const rgba = drawScaled(canvas, 0, 0, canvas.width, canvas.height, rw, REC_H);
-  const data = new Float32Array(3 * REC_H * rw);
-  const plane = REC_H * rw;
-  for (let i = 0, p = 0; p < plane; p++, i += 4) {
-    // BGR, normalized to [-1,1]:  (v/255 - 0.5) / 0.5
-    data[p] = rgba[i + 2] / 127.5 - 1; // B
-    data[plane + p] = rgba[i + 1] / 127.5 - 1; // G
-    data[2 * plane + p] = rgba[i] / 127.5 - 1; // R
-  }
-  return new ort.Tensor("float32", data, [1, 3, REC_H, rw]);
-}
-
-function ctcDecode(probs, T, C) {
+function ctcDecode(probs, base, T, C) {
   let prev = -1;
   let text = "";
   let scoreSum = 0, scoreN = 0;
   for (let t = 0; t < T; t++) {
-    const off = t * C;
+    const off = base + t * C;
     let best = 0, bestVal = probs[off];
     for (let c = 1; c < C; c++) {
       const v = probs[off + c];
@@ -385,15 +427,74 @@ function ctcDecode(probs, T, C) {
   return { text, score: scoreN ? scoreSum / scoreN : 0 };
 }
 
-async function recognizeLine(source, poly) {
-  const crop = cropPoly(source, poly);
-  if (!crop || crop.width < 2 || crop.height < 2) return { text: "", score: 0 };
-  const oriented = await clsMaybeFlip(crop);
-  const tensor = recPreprocess(oriented);
-  const out = await runSession(_sessions.rec, tensor);
-  const o = out[_sessions.rec.outputNames[0]];
-  const [, T, C] = o.dims; // [1, T, 18385]
-  return ctcDecode(o.data, T, C);
+// Recognize every poly of `source` in one pass: crop+resize all lines, batch
+// the orientation classifier, then batch rec with width-sorted zero-padded
+// chunks (PaddleOCR's rec_batch_num strategy). Returns results aligned with
+// `polys`; failed/degenerate crops yield {text:'', score:0}.
+async function recognizeLines(source, polys) {
+  const results = polys.map(() => ({ text: "", score: 0 }));
+  const lines = polys.map((poly) => {
+    const crop = cropPoly(source, poly);
+    if (!crop || crop.width < 2 || crop.height < 2) return null;
+    const rw = Math.max(1, Math.round((REC_H * crop.width) / crop.height));
+    return {
+      rw,
+      recRgba: drawScaled(crop, 0, 0, crop.width, crop.height, rw, REC_H),
+      clsRgba: _sessions.cls
+        ? drawScaled(crop, 0, 0, crop.width, crop.height, CLS_W, CLS_H)
+        : null,
+    };
+  });
+
+  const flags = await clsFlags(lines);
+  flags.forEach((f, i) => { if (f) flip180(lines[i].recRgba); });
+
+  const order = lines
+    .map((l, i) => (l ? i : -1))
+    .filter((i) => i >= 0)
+    .sort((a, b) => lines[a].rw - lines[b].rw);
+  let done = 0;
+  for (let off = 0; off < order.length; off += REC_BATCH) {
+    const chunk = order.slice(off, off + REC_BATCH);
+    const run = async (idxs) => {
+      const maxW = Math.max(...idxs.map((i) => lines[i].rw));
+      const plane = REC_H * maxW;
+      const data = new Float32Array(idxs.length * 3 * plane); // zeros = padding
+      idxs.forEach((lineIdx, j) => {
+        const { rw, recRgba } = lines[lineIdx];
+        const base = j * 3 * plane;
+        for (let y = 0; y < REC_H; y++) {
+          for (let x = 0; x < rw; x++) {
+            const i = (y * rw + x) * 4;
+            const p = y * maxW + x;
+            // BGR, normalized to [-1,1]:  (v/255 - 0.5) / 0.5
+            data[base + p] = recRgba[i + 2] / 127.5 - 1;
+            data[base + plane + p] = recRgba[i + 1] / 127.5 - 1;
+            data[base + 2 * plane + p] = recRgba[i] / 127.5 - 1;
+          }
+        }
+      });
+      const out = await runSession(
+        _sessions.rec,
+        new ort.Tensor("float32", data, [idxs.length, 3, REC_H, maxW]),
+      );
+      const o = out[_sessions.rec.outputNames[0]];
+      const [, T, C] = o.dims; // [n, T, 18385]
+      idxs.forEach((lineIdx, j) => {
+        results[lineIdx] = ctcDecode(o.data, j * T * C, T, C);
+      });
+    };
+    try {
+      await run(chunk);
+    } catch (err) {
+      if (chunk.length === 1) throw err;
+      for (const i of chunk) await run([i]); // model may reject batches
+    }
+    done += chunk.length;
+    _onProgress(`识别 ${done}/${order.length} 行…`);
+  }
+  _onProgress("");
+  return results;
 }
 
 // ---------- public API ----------
@@ -422,12 +523,13 @@ async function recognizeFull(source, W, H, opts = {}) {
   const found = dbPostprocess(probT.data, mh, mw, W / nw, H / nh, W, H);
   sortReadingOrder(found);
   const tDb = performance.now(); // detection inference (t2-t1) | DB post-process (tDb-t2)
+  const texts = await recognizeLines(source, found.map((f) => f.poly));
   const items = [];
-  for (const f of found) {
-    const { text, score } = await recognizeLine(source, f.poly);
-    if (!text || score < REC_SCORE_FLOOR) continue;
+  found.forEach((f, i) => {
+    const { text, score } = texts[i];
+    if (!text || score < REC_SCORE_FLOOR) return;
     items.push({ text, score, poly: f.poly, box: f.box });
-  }
+  });
   const t3 = performance.now();
   return {
     width: W,
@@ -456,15 +558,11 @@ async function recognizeRegion(source, W, H) {
   // if detection finds nothing in a hand-drawn region, fall back to the whole box
   if (!found.length) found = [{ poly: rectPoly([0, 0, W, H]), box: [0, 0, W, H], score: 1 }];
   sortReadingOrder(found);
-  const parts = [];
-  const scores = [];
-  for (const f of found) {
-    const { text, score } = await recognizeLine(source, f.poly);
-    if (text) { parts.push(text); scores.push(score); }
-  }
+  const texts = await recognizeLines(source, found.map((f) => f.poly));
+  const parts = texts.filter((t) => t.text);
   return {
-    text: parts.join(" "),
-    score: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : null,
+    text: parts.map((t) => t.text).join(" "),
+    score: parts.length ? parts.reduce((a, t) => a + t.score, 0) / parts.length : null,
     timings: { region_ms: round1(performance.now() - t0) },
   };
 }

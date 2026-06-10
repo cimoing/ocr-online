@@ -4,6 +4,10 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PP-OCRv5 浏览器 OCR</title>
+  <!-- GitHub Pages can't send COOP/COEP headers; this service worker injects
+       them so crossOriginIsolated becomes true and wasm threads unlock.
+       (One automatic reload on first visit.) -->
+  <script src="%BASE_URL%coi-serviceworker.min.js"></script>
   <link rel="stylesheet" href="%BASE_URL%style.css" />
 </head>
 <body>
