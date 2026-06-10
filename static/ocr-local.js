@@ -8,10 +8,11 @@
 import * as ort from "./vendor/ort/ort.wasm.bundle.min.mjs?v=1";
 
 // Single-threaded wasm: avoids the SharedArrayBuffer / COOP+COEP requirement
-// while still using SIMD. (Threads are a P3 optimization behind cross-origin
-// isolation headers.)
+// while still using SIMD. `proxy` moves session.run into a worker so heavy
+// inference never blocks the UI thread.
 ort.env.wasm.wasmPaths = new URL("./vendor/ort/", import.meta.url).href;
 ort.env.wasm.numThreads = 1;
+ort.env.wasm.proxy = true;
 
 const MODELS = {
   det: new URL("./models/det.onnx", import.meta.url).href,
@@ -19,7 +20,7 @@ const MODELS = {
   keys: new URL("./models/ppocrv5_keys.txt", import.meta.url).href,
 };
 
-// --- detection: must mirror app/ocr_service.py + inference.yml exactly ---
+// --- detection: mirrors PaddleOCR DetResizeForTest + NormalizeImage ---
 const DET_LIMIT = 960; // resize long side to this (DetResizeForTest)
 const DET_MEAN = [0.485, 0.456, 0.406]; // applied per channel to B,G,R order
 const DET_STD = [0.229, 0.224, 0.225];
@@ -30,7 +31,9 @@ const DET_UNCLIP = 1.2;
 const DET_MIN_SIZE = 3;
 
 const REC_H = 48; // recognition input height (image_shape [3,48,*])
-const MIN_REC_SCORE = 0.85; // drop low-confidence reads (matches recognize())
+// Engine-level floor only rejects garbage; the UI filters further with a
+// user-adjustable threshold so borderline-but-correct lines aren't lost.
+const REC_SCORE_FLOOR = 0.3;
 
 let _sessions = null; // { det, rec }
 let _classes = null; // ['<blank>', ...18383 keys, ' ']  (len 18385)
@@ -110,8 +113,8 @@ function detPreprocess(source, W, H) {
   return { tensor: new ort.Tensor("float32", data, [1, 3, nh, nw]), nw, nh };
 }
 
-// Axis-aligned DB post-process via BFS flood-fill (mirrors db_postprocess in
-// scripts/onnx_verify.py). Returns boxes [x0,y0,x1,y1,score] in ORIGINAL px.
+// Axis-aligned DB post-process via BFS flood-fill.
+// Returns boxes [x0,y0,x1,y1,score] in ORIGINAL px.
 function dbPostprocess(prob, mh, mw, sx, sy) {
   const bin = new Uint8Array(mh * mw);
   for (let i = 0; i < bin.length; i++) bin[i] = prob[i] > DET_THRESH ? 1 : 0;
@@ -225,7 +228,7 @@ async function recognizeFull(source, W, H) {
   const items = [];
   for (const b of boxes) {
     const { text, score } = await recognizeLine(source, b);
-    if (!text || score < MIN_REC_SCORE) continue;
+    if (!text || score < REC_SCORE_FLOOR) continue;
     const box = [b[0], b[1], b[2], b[3]];
     items.push({ text, score, poly: rectPoly(box), box });
   }

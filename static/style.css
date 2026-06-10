@@ -286,8 +286,10 @@ body {
   justify-content: space-between;
   gap: 12px;
 }
+.bar-row .status { flex: 1; min-width: 0; }
 .status.err { color: #dc2626; }
-.mask-ctl { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.hidden-note { color: #b45309; font-size: 12px; white-space: nowrap; }
+.mask-ctl { display: flex; align-items: center; gap: 8px; font-size: 12px; white-space: nowrap; }
 .mask-ctl input[type="range"] { width: 120px; }
 
 /* per-stage timing chips */

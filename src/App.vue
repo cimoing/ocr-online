@@ -70,7 +70,7 @@
         @mouseout="onOverlayMouseOut"
       >
         <div
-          v-for="item in items"
+          v-for="item in visibleItems"
           :key="item.id"
           class="ocr-box"
           :class="{ selected: item.id === selectedId, recognizing: item.id === recognizingId }"
@@ -98,6 +98,13 @@
   <footer class="statusbar">
     <div class="bar-row">
       <span class="status" :class="{ err: statusError }">{{ status }}</span>
+      <span v-if="hiddenCount" class="hidden-note" title="低于置信过滤阈值的行已隐藏，调低阈值可显示">
+        已隐藏 {{ hiddenCount }} 行低置信
+      </span>
+      <label class="mask-ctl" title="低于该置信度的识别行将被隐藏（不参与复制/导出）">
+        置信过滤 {{ minScorePct }}%
+        <input type="range" min="0" max="100" v-model.number="minScorePct" />
+      </label>
       <label class="mask-ctl" title="调节文字遮罩不透明度：高=用识别文字盖住原图，低=透出原图对照">
         文字遮罩
         <input type="range" min="0" max="100" v-model.number="mask" />
@@ -157,6 +164,7 @@ export default {
       toastVisible: false,
       toastTimer: null,
       mask: 90,
+      minScorePct: 60,
       timingChips: [],
       editMode: false,
       selectedId: null,
@@ -175,8 +183,17 @@ export default {
     items() {
       return this.current?.items || [];
     },
+    // User-drawn / re-recognized boxes (pinned) always show; the rest must
+    // clear the confidence slider. Hidden lines are excluded from copy/export.
+    visibleItems() {
+      const min = this.minScorePct / 100;
+      return this.items.filter((it) => it.pinned || it.score == null || it.score >= min);
+    },
+    hiddenCount() {
+      return this.items.length - this.visibleItems.length;
+    },
     hasItems() {
-      return this.items.length > 0;
+      return this.visibleItems.length > 0;
     },
   },
   updated() {
@@ -396,8 +413,8 @@ export default {
     },
     async copyAll() {
       if (!this.hasItems) return;
-      await this.copyText(this.items.map((i) => i.text).join("\n"));
-      this.showToast(`已复制 ${this.items.length} 行`);
+      await this.copyText(this.visibleItems.map((i) => i.text).join("\n"));
+      this.showToast(`已复制 ${this.visibleItems.length} 行`);
     },
     onOverlayClick(e) {
       if (this.editMode) {
@@ -619,6 +636,7 @@ export default {
         const data = await localOCR.recognizeRegion(c, c.width, c.height);
         item.text = data.text || "";
         item.score = data.score;
+        item.pinned = true; // user-adjusted region: never hide behind the slider
         this.showToast(item.text ? `已识别：${item.text.slice(0, 24)}` : "该区域未识别到文字");
       } catch (err) {
         this.showToast(`区域识别失败：${err.message || err}`);
