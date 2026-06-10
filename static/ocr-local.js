@@ -17,25 +17,37 @@ ort.env.wasm.proxy = true;
 const MODELS = {
   det: new URL("./models/det.onnx", import.meta.url).href,
   rec: new URL("./models/rec.onnx", import.meta.url).href,
+  cls: new URL("./models/cls.onnx", import.meta.url).href,
   keys: new URL("./models/ppocrv5_keys.txt", import.meta.url).href,
 };
 
 // --- detection: mirrors PaddleOCR DetResizeForTest + NormalizeImage ---
-const DET_LIMIT = 960; // resize long side to this (DetResizeForTest)
+const DET_LIMIT_DEFAULT = 960; // resize long side to this (DetResizeForTest)
 const DET_MEAN = [0.485, 0.456, 0.406]; // applied per channel to B,G,R order
 const DET_STD = [0.229, 0.224, 0.225];
-// DBPostProcess thresholds — the app's tuned values (precision on clean print)
-const DET_THRESH = 0.4;
-const DET_BOX_THRESH = 0.7;
-const DET_UNCLIP = 1.2;
-const DET_MIN_SIZE = 3;
+// DBPostProcess thresholds — PaddleOCR defaults. Geometry now matches the
+// reference pipeline (min-area rect + polygon unclip), so the conservative
+// values that compensated for the old axis-aligned approximation are gone.
+const DET_THRESH = 0.3;
+const DET_BOX_THRESH = 0.6;
+const DET_UNCLIP = 1.5;
+const DET_MIN_SIZE = 3; // reject boxes whose short side is below this (map px)
 
 const REC_H = 48; // recognition input height (image_shape [3,48,*])
 // Engine-level floor only rejects garbage; the UI filters further with a
 // user-adjustable threshold so borderline-but-correct lines aren't lost.
 const REC_SCORE_FLOOR = 0.3;
 
-let _sessions = null; // { det, rec }
+// --- text-line orientation classifier (optional, models/cls.onnx) ---
+// PP-LCNet_x0_25_textline_ori: plain resize to 160x80, RGB + ImageNet
+// normalization, softmax over ['0_degree','180_degree'] (per its inference.yml).
+const CLS_W = 160;
+const CLS_H = 80;
+// PaddleX flips on bare argmax; a mild margin avoids flipping upright lines
+// on coin-toss outputs while still catching genuinely inverted text.
+const CLS_THRESH = 0.6;
+
+let _sessions = null; // { det, rec, cls|null }
 let _classes = null; // ['<blank>', ...18383 keys, ' ']  (len 18385)
 let _initPromise = null;
 let _onProgress = () => {};
@@ -77,11 +89,23 @@ function init() {
     _onProgress("初始化推理引擎…");
     const det = await ort.InferenceSession.create(detBuf, opts);
     const rec = await ort.InferenceSession.create(recBuf, opts);
-    _sessions = { det, rec };
+    // Orientation classifier is optional: older deployments may not ship it.
+    let cls = null;
+    try {
+      const clsBuf = await fetchBuffer(MODELS.cls, "方向分类模型");
+      cls = await ort.InferenceSession.create(clsBuf, opts);
+    } catch (_) {
+      console.warn("cls.onnx 不可用，跳过文本方向分类（180° 翻转图片将识别失败）");
+    }
+    _sessions = { det, rec, cls };
     _onProgress("");
     return _sessions;
   })();
   return _initPromise;
+}
+
+function runSession(sess, tensor) {
+  return sess.run({ [sess.inputNames[0]]: tensor });
 }
 
 // ---------- shared canvas scratch ----------
@@ -95,9 +119,13 @@ function drawScaled(source, sx, sy, sw, sh, dw, dh) {
   return _ctx.getImageData(0, 0, dw, dh).data; // RGBA
 }
 
+// dedicated scratch for rotated line crops (recPreprocess reuses _cv)
+const _cropCv = document.createElement("canvas");
+const _cropCtx = _cropCv.getContext("2d", { willReadFrequently: true });
+
 // ---------- detection ----------
-function detPreprocess(source, W, H) {
-  const ratio = DET_LIMIT / Math.max(W, H); // long side -> 960 (up or down)
+function detPreprocess(source, W, H, limit) {
+  const ratio = limit / Math.max(W, H); // long side -> limit (up or down)
   const nw = Math.max(32, Math.round((W * ratio) / 32) * 32);
   const nh = Math.max(32, Math.round((H * ratio) / 32) * 32);
   const rgba = drawScaled(source, 0, 0, W, H, nw, nh);
@@ -113,49 +141,218 @@ function detPreprocess(source, W, H) {
   return { tensor: new ort.Tensor("float32", data, [1, 3, nh, nw]), nw, nh };
 }
 
-// Axis-aligned DB post-process via BFS flood-fill.
-// Returns boxes [x0,y0,x1,y1,score] in ORIGINAL px.
-function dbPostprocess(prob, mh, mw, sx, sy) {
+// ---------- geometry ----------
+// Andrew monotone chain convex hull. Input/output: [[x,y], ...].
+function convexHull(points) {
+  const pts = points.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  if (pts.length <= 2) return pts;
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower = [];
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper = [];
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
+}
+
+// Rotating calipers: smallest-area oriented rectangle enclosing the hull.
+// Returns 4 corners (consistent winding, arbitrary start).
+function minAreaRect(hull) {
+  if (hull.length === 1) return [hull[0], hull[0], hull[0], hull[0]];
+  if (hull.length === 2) return [hull[0], hull[1], hull[1], hull[0]];
+  let best = null;
+  for (let i = 0; i < hull.length; i++) {
+    const [x1, y1] = hull[i];
+    const [x2, y2] = hull[(i + 1) % hull.length];
+    const len = Math.hypot(x2 - x1, y2 - y1);
+    if (!len) continue;
+    const ux = (x2 - x1) / len, uy = (y2 - y1) / len;
+    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+    for (const [px, py] of hull) {
+      const u = px * ux + py * uy;
+      const v = py * ux - px * uy; // projection on the perpendicular (-uy, ux)
+      if (u < minU) minU = u;
+      if (u > maxU) maxU = u;
+      if (v < minV) minV = v;
+      if (v > maxV) maxV = v;
+    }
+    const area = (maxU - minU) * (maxV - minV);
+    if (!best || area < best.area) best = { area, ux, uy, minU, maxU, minV, maxV };
+  }
+  const { ux, uy, minU, maxU, minV, maxV } = best;
+  const corner = (u, v) => [u * ux - v * uy, u * uy + v * ux];
+  return [corner(minU, minV), corner(maxU, minV), corner(maxU, maxV), corner(minU, maxV)];
+}
+
+// PaddleOCR get_mini_boxes ordering: [tl, tr, br, bl], tl→tr = reading axis.
+function orderCorners(rect) {
+  const pts = rect.slice().sort((a, b) => a[0] - b[0]);
+  const tl = pts[0][1] <= pts[1][1] ? pts[0] : pts[1];
+  const bl = pts[0][1] <= pts[1][1] ? pts[1] : pts[0];
+  const tr = pts[2][1] <= pts[3][1] ? pts[2] : pts[3];
+  const br = pts[2][1] <= pts[3][1] ? pts[3] : pts[2];
+  return [tl, tr, br, bl];
+}
+
+// DB post-process, mirroring PaddleOCR DBPostProcess: connected components on
+// the binarized prob map -> convex hull -> min-area rect -> unclip expansion.
+// Returns [{poly, box, score}] in ORIGINAL px; poly is [tl,tr,br,bl], box is
+// the axis-aligned [x0,y0,x1,y1] envelope used by the fine-tune editor.
+function dbPostprocess(prob, mh, mw, sx, sy, W, H) {
   const bin = new Uint8Array(mh * mw);
   for (let i = 0; i < bin.length; i++) bin[i] = prob[i] > DET_THRESH ? 1 : 0;
   const visited = new Uint8Array(mh * mw);
   const stack = new Int32Array(mh * mw);
-  const boxes = [];
+  // per-row extremes of the current component; enough for its convex hull
+  const rowMin = new Int32Array(mh).fill(-1);
+  const rowMax = new Int32Array(mh);
+  const rows = [];
+  const out = [];
   for (let start = 0; start < bin.length; start++) {
     if (!bin[start] || visited[start]) continue;
     let sp = 0;
     stack[sp++] = start;
     visited[start] = 1;
-    let minx = mw, maxx = 0, miny = mh, maxy = 0, sum = 0, cnt = 0;
+    let sum = 0, cnt = 0;
+    rows.length = 0;
     while (sp > 0) {
       const idx = stack[--sp];
       const x = idx % mw, y = (idx - x) / mw;
-      sum += prob[idx]; cnt++;
-      if (x < minx) minx = x;
-      if (x > maxx) maxx = x;
-      if (y < miny) miny = y;
-      if (y > maxy) maxy = y;
+      sum += prob[idx];
+      cnt++;
+      if (rowMin[y] < 0) { rowMin[y] = x; rowMax[y] = x; rows.push(y); }
+      else if (x < rowMin[y]) rowMin[y] = x;
+      else if (x > rowMax[y]) rowMax[y] = x;
       if (x + 1 < mw && bin[idx + 1] && !visited[idx + 1]) { visited[idx + 1] = 1; stack[sp++] = idx + 1; }
       if (x - 1 >= 0 && bin[idx - 1] && !visited[idx - 1]) { visited[idx - 1] = 1; stack[sp++] = idx - 1; }
       if (y + 1 < mh && bin[idx + mw] && !visited[idx + mw]) { visited[idx + mw] = 1; stack[sp++] = idx + mw; }
       if (y - 1 >= 0 && bin[idx - mw] && !visited[idx - mw]) { visited[idx - mw] = 1; stack[sp++] = idx - mw; }
     }
-    if (cnt < DET_MIN_SIZE) continue;
     const score = sum / cnt;
+    const pts = [];
+    for (const y of rows) {
+      pts.push([rowMin[y], y], [rowMax[y], y]);
+      rowMin[y] = -1;
+    }
     if (score < DET_BOX_THRESH) continue;
-    const x0 = minx, y0 = miny, x1 = maxx + 1, y1 = maxy + 1;
-    const w = x1 - x0, h = y1 - y0;
-    const per = 2 * (w + h);
-    const d = per ? (w * h * DET_UNCLIP) / per : 0; // unclip dilation
-    boxes.push([(x0 - d) * sx, (y0 - d) * sy, (x1 + d) * sx, (y1 + d) * sy, score]);
+    const rect = orderCorners(minAreaRect(convexHull(pts)));
+    const w = Math.hypot(rect[1][0] - rect[0][0], rect[1][1] - rect[0][1]);
+    const h = Math.hypot(rect[3][0] - rect[0][0], rect[3][1] - rect[0][1]);
+    if (Math.min(w, h) < DET_MIN_SIZE) continue;
+    // unclip: offset each side outward by area*ratio/perimeter (Vatti offset
+    // of a rectangle == growing both half-extents by d)
+    const d = (w * h * DET_UNCLIP) / (2 * (w + h));
+    const cx = (rect[0][0] + rect[2][0]) / 2;
+    const cy = (rect[0][1] + rect[2][1]) / 2;
+    const ux = (rect[1][0] - rect[0][0]) / w, uy = (rect[1][1] - rect[0][1]) / w;
+    const vx = (rect[3][0] - rect[0][0]) / h, vy = (rect[3][1] - rect[0][1]) / h;
+    const hw = w / 2 + d, hh = h / 2 + d;
+    let poly = [
+      [cx - ux * hw - vx * hh, cy - uy * hw - vy * hh],
+      [cx + ux * hw - vx * hh, cy + uy * hw - vy * hh],
+      [cx + ux * hw + vx * hh, cy + uy * hw + vy * hh],
+      [cx - ux * hw + vx * hh, cy - uy * hw + vy * hh],
+    ];
+    // map-space -> original px, clamped to the image
+    poly = poly.map(([x, y]) => [
+      Math.max(0, Math.min(x * sx, W)),
+      Math.max(0, Math.min(y * sy, H)),
+    ]);
+    const xs = poly.map((p) => p[0]);
+    const ys = poly.map((p) => p[1]);
+    out.push({
+      poly,
+      box: [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)],
+      score,
+    });
   }
-  return boxes;
+  return out;
+}
+
+// ---------- rotated line crop ----------
+// Equivalent of PaddleOCR get_rotate_crop_image. det polys are parallelograms
+// (axis-scaled rotated rects), so an affine map is exact: dest (0,0)<-tl,
+// (w,0)<-tr, (0,h)<-bl. Vertical lines (h >= 1.5w) are rotated 90° CCW like
+// np.rot90 so the recognizer reads them horizontally.
+function cropPoly(source, poly) {
+  const [p0, p1, p2, p3] = poly;
+  const w = Math.max(1, Math.round(Math.max(
+    Math.hypot(p1[0] - p0[0], p1[1] - p0[1]),
+    Math.hypot(p2[0] - p3[0], p2[1] - p3[1]),
+  )));
+  const h = Math.max(1, Math.round(Math.max(
+    Math.hypot(p3[0] - p0[0], p3[1] - p0[1]),
+    Math.hypot(p2[0] - p1[0], p2[1] - p1[1]),
+  )));
+  _cropCv.width = w;
+  _cropCv.height = h;
+  const mA = (p1[0] - p0[0]) / w, mB = (p1[1] - p0[1]) / w;
+  const mC = (p3[0] - p0[0]) / h, mD = (p3[1] - p0[1]) / h;
+  const det = mA * mD - mC * mB;
+  if (!det) return null;
+  _cropCtx.setTransform(
+    mD / det, -mB / det, -mC / det, mA / det,
+    (mC * p0[1] - mD * p0[0]) / det,
+    (mB * p0[0] - mA * p0[1]) / det,
+  );
+  _cropCtx.drawImage(source, 0, 0);
+  _cropCtx.setTransform(1, 0, 0, 1, 0, 0);
+  if (h >= 1.5 * w) {
+    const o = document.createElement("canvas");
+    o.width = h;
+    o.height = w;
+    const ctx = o.getContext("2d");
+    ctx.translate(0, w);
+    ctx.rotate(-Math.PI / 2);
+    ctx.drawImage(_cropCv, 0, 0);
+    return o;
+  }
+  return _cropCv;
+}
+
+// ---------- orientation classifier ----------
+function clsPreprocess(canvas) {
+  const rgba = drawScaled(canvas, 0, 0, canvas.width, canvas.height, CLS_W, CLS_H);
+  const data = new Float32Array(3 * CLS_H * CLS_W);
+  const plane = CLS_H * CLS_W;
+  for (let i = 0, p = 0; p < plane; p++, i += 4) {
+    // RGB order with ImageNet stats (classification heads differ from det/rec)
+    data[p] = (rgba[i] / 255 - DET_MEAN[0]) / DET_STD[0];
+    data[plane + p] = (rgba[i + 1] / 255 - DET_MEAN[1]) / DET_STD[1];
+    data[2 * plane + p] = (rgba[i + 2] / 255 - DET_MEAN[2]) / DET_STD[2];
+  }
+  return new ort.Tensor("float32", data, [1, 3, CLS_H, CLS_W]);
+}
+
+async function clsMaybeFlip(canvas) {
+  if (!_sessions.cls) return canvas;
+  const out = await runSession(_sessions.cls, clsPreprocess(canvas));
+  const o = out[_sessions.cls.outputNames[0]].data; // softmax over ['0','180']
+  if (o[1] > o[0] && o[1] >= CLS_THRESH) {
+    const f = document.createElement("canvas");
+    f.width = canvas.width;
+    f.height = canvas.height;
+    const ctx = f.getContext("2d");
+    ctx.translate(f.width, f.height);
+    ctx.rotate(Math.PI);
+    ctx.drawImage(canvas, 0, 0);
+    return f;
+  }
+  return canvas;
 }
 
 // ---------- recognition ----------
-function recPreprocess(source, sx, sy, sw, sh) {
-  const rw = Math.max(1, Math.round((REC_H * sw) / sh));
-  const rgba = drawScaled(source, sx, sy, sw, sh, rw, REC_H);
+function recPreprocess(canvas) {
+  const rw = Math.max(1, Math.round((REC_H * canvas.width) / canvas.height));
+  const rgba = drawScaled(canvas, 0, 0, canvas.width, canvas.height, rw, REC_H);
   const data = new Float32Array(3 * REC_H * rw);
   const plane = REC_H * rw;
   for (let i = 0, p = 0; p < plane; p++, i += 4) {
@@ -188,12 +385,12 @@ function ctcDecode(probs, T, C) {
   return { text, score: scoreN ? scoreSum / scoreN : 0 };
 }
 
-async function recognizeLine(source, box) {
-  const [x0, y0, x1, y1] = box;
-  const sw = x1 - x0, sh = y1 - y0;
-  if (sw < 2 || sh < 2) return { text: "", score: 0 };
-  const tensor = recPreprocess(source, x0, y0, sw, sh);
-  const out = await _sessions.rec.run({ x: tensor });
+async function recognizeLine(source, poly) {
+  const crop = cropPoly(source, poly);
+  if (!crop || crop.width < 2 || crop.height < 2) return { text: "", score: 0 };
+  const oriented = await clsMaybeFlip(crop);
+  const tensor = recPreprocess(oriented);
+  const out = await runSession(_sessions.rec, tensor);
   const o = out[_sessions.rec.outputNames[0]];
   const [, T, C] = o.dims; // [1, T, 18385]
   return ctcDecode(o.data, T, C);
@@ -204,33 +401,32 @@ function rectPoly(b) {
   return [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
 }
 
+function sortReadingOrder(entries) {
+  entries.sort(
+    (a, b) => (Math.round(a.box[1] / 10) - Math.round(b.box[1] / 10)) || a.box[0] - b.box[0],
+  );
+}
+
 // Detect + recognize a full image. `source` is an HTMLImageElement / canvas;
 // W,H are its natural (original) pixel size.
-async function recognizeFull(source, W, H) {
+async function recognizeFull(source, W, H, opts = {}) {
   await init();
+  const detLimit = +opts.detLimit || DET_LIMIT_DEFAULT;
   const t0 = performance.now();
-  const { tensor, nw, nh } = detPreprocess(source, W, H);
+  const { tensor, nw, nh } = detPreprocess(source, W, H, detLimit);
   const t1 = performance.now();
-  const detOut = await _sessions.det.run({ x: tensor });
+  const detOut = await runSession(_sessions.det, tensor);
   const probT = detOut[_sessions.det.outputNames[0]];
   const [, , mh, mw] = probT.dims;
   const t2 = performance.now();
-  const boxes = dbPostprocess(probT.data, mh, mw, W / nw, H / nh);
-  // clamp to image and sort in reading order (top, then left)
-  for (const b of boxes) {
-    b[0] = Math.max(0, Math.min(b[0], W));
-    b[1] = Math.max(0, Math.min(b[1], H));
-    b[2] = Math.max(0, Math.min(b[2], W));
-    b[3] = Math.max(0, Math.min(b[3], H));
-  }
-  boxes.sort((a, b) => (Math.round(a[1] / 10) - Math.round(b[1] / 10)) || a[0] - b[0]);
+  const found = dbPostprocess(probT.data, mh, mw, W / nw, H / nh, W, H);
+  sortReadingOrder(found);
   const tDb = performance.now(); // detection inference (t2-t1) | DB post-process (tDb-t2)
   const items = [];
-  for (const b of boxes) {
-    const { text, score } = await recognizeLine(source, b);
+  for (const f of found) {
+    const { text, score } = await recognizeLine(source, f.poly);
     if (!text || score < REC_SCORE_FLOOR) continue;
-    const box = [b[0], b[1], b[2], b[3]];
-    items.push({ text, score, poly: rectPoly(box), box });
+    items.push({ text, score, poly: f.poly, box: f.box });
   }
   const t3 = performance.now();
   return {
@@ -238,7 +434,7 @@ async function recognizeFull(source, W, H) {
     height: H,
     items,
     timings: {
-      // non-overlapping buckets: preprocess + inference(det+rec) + postprocess(DB) = total
+      // non-overlapping buckets: preprocess + inference(det+cls+rec) + postprocess(DB) = total
       preprocess_ms: round1(t1 - t0),
       inference_ms: round1((t2 - t1) + (t3 - tDb)),
       postprocess_ms: round1(tDb - t2),
@@ -252,18 +448,18 @@ async function recognizeFull(source, W, H) {
 async function recognizeRegion(source, W, H) {
   await init();
   const t0 = performance.now();
-  const { tensor, nw, nh } = detPreprocess(source, W, H);
-  const detOut = await _sessions.det.run({ x: tensor });
+  const { tensor, nw, nh } = detPreprocess(source, W, H, DET_LIMIT_DEFAULT);
+  const detOut = await runSession(_sessions.det, tensor);
   const probT = detOut[_sessions.det.outputNames[0]];
   const [, , mh, mw] = probT.dims;
-  let boxes = dbPostprocess(probT.data, mh, mw, W / nw, H / nh);
+  let found = dbPostprocess(probT.data, mh, mw, W / nw, H / nh, W, H);
   // if detection finds nothing in a hand-drawn region, fall back to the whole box
-  if (!boxes.length) boxes = [[0, 0, W, H, 1]];
-  boxes.sort((a, b) => (Math.round(a[1] / 10) - Math.round(b[1] / 10)) || a[0] - b[0]);
+  if (!found.length) found = [{ poly: rectPoly([0, 0, W, H]), box: [0, 0, W, H], score: 1 }];
+  sortReadingOrder(found);
   const parts = [];
   const scores = [];
-  for (const b of boxes) {
-    const { text, score } = await recognizeLine(source, b);
+  for (const f of found) {
+    const { text, score } = await recognizeLine(source, f.poly);
     if (text) { parts.push(text); scores.push(score); }
   }
   return {

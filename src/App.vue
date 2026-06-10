@@ -9,6 +9,16 @@
     </div>
     <div class="controls">
       <span class="mode-pill" title="det + rec 全流程在浏览器本地运行，不调用服务端识别接口">本地·浏览器</span>
+      <select
+        v-model.number="detLimit"
+        class="det-limit"
+        :disabled="busy"
+        title="检测分辨率：更高对小字/大图更准，但更慢"
+      >
+        <option :value="960">标准 960</option>
+        <option :value="1280">高清 1280</option>
+        <option :value="1536">超清 1536</option>
+      </select>
       <button class="btn primary" type="button" :disabled="busy || !currentBlob" @click="recognize">识别</button>
       <button class="btn" type="button" :disabled="!hasItems" @click="copyAll">复制全部</button>
       <button
@@ -165,6 +175,7 @@ export default {
       toastTimer: null,
       mask: 90,
       minScorePct: 60,
+      detLimit: 960,
       timingChips: [],
       editMode: false,
       selectedId: null,
@@ -290,7 +301,7 @@ export default {
 
           const script = document.createElement("script");
           script.type = "module";
-          script.src = `${import.meta.env.BASE_URL}ocr-local.js?v=3`;
+          script.src = `${import.meta.env.BASE_URL}ocr-local.js?v=4`;
           script.dataset.ocrLocal = "true";
           script.addEventListener("load", resolve, { once: true });
           script.addEventListener("error", () => reject(new Error("本地推理模块加载失败")), { once: true });
@@ -318,7 +329,9 @@ export default {
         localOCR.onProgress((s) => {
           if (s) this.setStatus(`本地模型 · ${s}`);
         });
-        const data = await localOCR.recognizeFull(img, img.naturalWidth, img.naturalHeight);
+        const data = await localOCR.recognizeFull(img, img.naturalWidth, img.naturalHeight, {
+          detLimit: this.detLimit,
+        });
         data.model = "local";
         data.count = data.items.length;
         this.ensureItemIds(data.items);

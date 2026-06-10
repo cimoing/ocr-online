@@ -18,6 +18,10 @@ const assets = {
     ppu + "recognition/PP-OCRv5_mobile_rec_infer.onnx",
     "d253c3cbee6e507828a5271a30ab0ec8ae7c2a99d0cc8e6f844fe380809d22b3",
   ],
+  "static/models/cls.onnx": [
+    ppu + "correction/PP-LCNet_x0_25_textline_ori.onnx",
+    "44dd0033f5215447fdce5f9333883c155806aebbb6bd00964d4a9b20e05d44b9",
+  ],
   "static/vendor/ort/ort-wasm-simd-threaded.wasm": [
     ort + "ort-wasm-simd-threaded.wasm",
     "040d52ce5066707a10d45cb9500c35e70a9c2fb33c4fb63428da9ae45b956b97",
