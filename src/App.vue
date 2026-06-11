@@ -358,6 +358,18 @@ export default {
         angle: Math.atan2(p1[1] - p0[1], p1[0] - p0[0]),
       };
     },
+    // Text size must follow the actual line height. In edit mode the box shown
+    // is the axis-aligned envelope of the (possibly rotated) poly, whose height
+    // can be several times the line height — sizing text from it makes fonts
+    // explode on slanted lines, so always prefer the poly's short edge.
+    lineHeightPx(item, g) {
+      if (item.poly) {
+        const [p0, , , p3] = item.poly;
+        const lh = Math.hypot(p3[0] - p0[0], p3[1] - p0[1]) * this.displayScale();
+        if (lh >= 1) return Math.min(g.h, lh);
+      }
+      return g.h;
+    },
     boxStyle(item) {
       const g = this.boxGeom(item);
       if (!g) return { display: "none" };
@@ -367,7 +379,7 @@ export default {
         width: `${g.w}px`,
         height: `${g.h}px`,
         transform: g.angle ? `rotate(${g.angle}rad)` : "",
-        "--font-size": `${g.h * 0.86}px`,
+        "--font-size": `${this.lineHeightPx(item, g) * 0.86}px`,
       };
     },
     fitText() {

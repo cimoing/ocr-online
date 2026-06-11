@@ -170,7 +170,16 @@ body {
   box-shadow: 0 6px 24px rgba(15, 23, 42, 0.18);
   background: #fff;
 }
-.canvas img { max-width: 100%; height: auto; display: block; }
+/* fit within the stage: never wider than the pane, never (much) taller than
+   the viewport, so huge scans/screenshots stay viewable without endless
+   scrolling. Overlay math follows clientWidth, so any display scale works. */
+.canvas img {
+  max-width: 100%;
+  max-height: calc(100vh - 170px); /* minus topbar + statusbar + stage padding */
+  width: auto;
+  height: auto;
+  display: block;
+}
 
 .overlay { position: absolute; inset: 0; --mask: 0.9; transition: opacity 0.12s ease; }
 /* "按住对比原图": momentarily hide the recognized-text overlay */
