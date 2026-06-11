@@ -2,41 +2,34 @@
 //
 // Everything runs client-side: det/rec/cls ONNX models are fetched once,
 // persisted in Cache Storage, and executed in wasm; there is no OCR API
-// round-trip.
-//
-// Exposes window.LocalOCR with a stable {width,height,items[]} result shape so
-// the Vue overlay / copy / fine-tune UI can consume it directly.
-import * as ort from "./vendor/ort/ort.wasm.bundle.min.mjs?v=1";
+// round-trip. Pure math lives in geometry.js / db.js / ctc.js so it can be
+// unit-tested without a DOM; this module owns canvases, ort and model I/O.
+import { ctcDecode } from "./ctc.js";
+import { dbPostprocess } from "./db.js";
+import { rectPoly, sortReadingOrder } from "./geometry.js";
 
-// `proxy` moves session.run into a worker so heavy inference never blocks the
-// UI thread. Threads need SharedArrayBuffer, i.e. crossOriginIsolated — true
-// in dev via vite server headers and on Pages via coi-serviceworker; when
-// isolation is missing we degrade to single-threaded SIMD wasm.
-ort.env.wasm.wasmPaths = new URL("./vendor/ort/", import.meta.url).href;
-ort.env.wasm.numThreads =
-  typeof crossOriginIsolated !== "undefined" && crossOriginIsolated
-    ? Math.min(4, Math.max(1, navigator.hardwareConcurrency || 1))
-    : 1;
-ort.env.wasm.proxy = true;
+const BASE = import.meta.env.BASE_URL;
+// ort stays a runtime (vendored) dependency rather than a bundled one: the
+// wasm bundle resolves its proxy worker + .wasm relative to its own URL, so
+// loading it from vendor/ort/ keeps that machinery self-contained. The URL is
+// built at runtime so vite's import analysis leaves the dynamic import native
+// (public-dir files must not enter the module graph). `bust` forces a fresh
+// module instance — ort caches a failed backend init per instance, so the
+// proxy-less retry needs a new one.
+const ortUrl = (bust) =>
+  new URL(`${BASE}vendor/ort/ort.wasm.bundle.min.mjs?${bust}`, location.href).href;
 
 const MODELS = {
-  det: new URL("./models/det.onnx", import.meta.url).href,
-  rec: new URL("./models/rec.onnx", import.meta.url).href,
-  cls: new URL("./models/cls.onnx", import.meta.url).href,
-  keys: new URL("./models/ppocrv5_keys.txt", import.meta.url).href,
+  det: `${BASE}models/det.onnx`,
+  rec: `${BASE}models/rec.onnx`,
+  cls: `${BASE}models/cls.onnx`,
+  keys: `${BASE}models/ppocrv5_keys.txt`,
 };
 
 // --- detection: mirrors PaddleOCR DetResizeForTest + NormalizeImage ---
 const DET_LIMIT_DEFAULT = 960; // resize long side to this (DetResizeForTest)
 const DET_MEAN = [0.485, 0.456, 0.406]; // applied per channel to B,G,R order
 const DET_STD = [0.229, 0.224, 0.225];
-// DBPostProcess thresholds — PaddleOCR defaults. Geometry now matches the
-// reference pipeline (min-area rect + polygon unclip), so the conservative
-// values that compensated for the old axis-aligned approximation are gone.
-const DET_THRESH = 0.3;
-const DET_BOX_THRESH = 0.6;
-const DET_UNCLIP = 1.5;
-const DET_MIN_SIZE = 3; // reject boxes whose short side is below this (map px)
 
 const REC_H = 48; // recognition input height (image_shape [3,48,*])
 const REC_BATCH = 8; // crops per rec run, sorted by width and zero-padded
@@ -54,6 +47,7 @@ const CLS_BATCH = 8;
 // on coin-toss outputs while still catching genuinely inverted text.
 const CLS_THRESH = 0.6;
 
+let _ort = null;
 let _sessions = null; // { det, rec, cls|null }
 let _classes = null; // ['<blank>', ...18383 keys, ' ']  (len 18385)
 let _initPromise = null;
@@ -111,30 +105,96 @@ async function fetchBuffer(url, label) {
   return out;
 }
 
-function init() {
+// ort's proxy spawns `new Worker(<bundle url>, {type:"module"})`. Probe that
+// exact capability with the small wasm glue module first: embedded/locked-down
+// browsers that only allow blob workers fire `error` almost immediately, and
+// booting with proxy enabled there would hang the whole init.
+function probeModuleWorker() {
+  return new Promise((resolve) => {
+    let w;
+    const done = (ok) => {
+      try { if (w) w.terminate(); } catch (_) {}
+      resolve(ok);
+    };
+    try {
+      w = new Worker(
+        new URL(`${BASE}vendor/ort/ort-wasm-simd-threaded.mjs`, location.href),
+        { type: "module" },
+      );
+      w.addEventListener("error", () => done(false));
+      setTimeout(() => done(true), 1200); // no quick error -> workers usable
+    } catch (_) {
+      done(false);
+    }
+  });
+}
+
+const withTimeout = (promise, ms, label) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms)),
+  ]);
+
+// Load a fresh ort module instance and build all sessions on it.
+// `proxy` moves session.run into a worker so heavy inference never blocks the
+// UI thread. Threads need SharedArrayBuffer, i.e. crossOriginIsolated — true
+// behind `vite preview` headers and on Pages via coi-serviceworker; when
+// isolation is missing we degrade to single-threaded SIMD wasm.
+async function boot(proxy, bust, bufs) {
+  const ort = await import(/* @vite-ignore */ ortUrl(bust));
+  ort.env.wasm.wasmPaths = new URL(`${BASE}vendor/ort/`, location.href).href;
+  ort.env.wasm.numThreads =
+    typeof crossOriginIsolated !== "undefined" && crossOriginIsolated
+      ? Math.min(4, Math.max(1, navigator.hardwareConcurrency || 1))
+      : 1;
+  ort.env.wasm.proxy = proxy;
+  const opts = { executionProviders: ["wasm"], graphOptimizationLevel: "all" };
+  const det = await ort.InferenceSession.create(bufs.det, opts);
+  const rec = await ort.InferenceSession.create(bufs.rec, opts);
+  // Orientation classifier is optional: older deployments may not ship it.
+  let cls = null;
+  if (bufs.cls) {
+    try {
+      cls = await ort.InferenceSession.create(bufs.cls, opts);
+    } catch (_) {
+      console.warn("cls.onnx 加载失败，跳过文本方向分类（180° 翻转图片将识别失败）");
+    }
+  }
+  _ort = ort;
+  _sessions = { det, rec, cls };
+}
+
+export function init() {
   if (_initPromise) return _initPromise;
   _initPromise = (async () => {
-    const opts = { executionProviders: ["wasm"], graphOptimizationLevel: "all" };
     _onProgress("下载检测模型…");
-    const detBuf = await fetchBuffer(MODELS.det, "检测模型");
+    const det = await fetchBuffer(MODELS.det, "检测模型");
     _onProgress("下载识别模型…");
-    const recBuf = await fetchBuffer(MODELS.rec, "识别模型");
+    const rec = await fetchBuffer(MODELS.rec, "识别模型");
     _onProgress("加载字典…");
     const keysBuf = await fetchBuffer(MODELS.keys, "字典");
     const keys = new TextDecoder().decode(keysBuf).replace(/\n$/, "").split("\n");
     _classes = ["<blank>", ...keys, " "]; // CTC: blank + dict + space
-    _onProgress("初始化推理引擎…");
-    const det = await ort.InferenceSession.create(detBuf, opts);
-    const rec = await ort.InferenceSession.create(recBuf, opts);
-    // Orientation classifier is optional: older deployments may not ship it.
     let cls = null;
     try {
-      const clsBuf = await fetchBuffer(MODELS.cls, "方向分类模型");
-      cls = await ort.InferenceSession.create(clsBuf, opts);
+      cls = await fetchBuffer(MODELS.cls, "方向分类模型");
     } catch (_) {
-      console.warn("cls.onnx 不可用，跳过文本方向分类（180° 翻转图片将识别失败）");
+      console.warn("cls.onnx 不可用，跳过文本方向分类");
     }
-    _sessions = { det, rec, cls };
+    const bufs = { det, rec, cls };
+    _onProgress("初始化推理引擎…");
+    const proxy = await probeModuleWorker();
+    try {
+      if (!proxy) throw new Error("module worker 探测失败");
+      const proxyBoot = boot(true, "v=1", bufs);
+      proxyBoot.catch(() => {}); // raced loser must not surface as unhandled
+      await withTimeout(proxyBoot, 20000, "ort proxy 初始化超时");
+    } catch (err) {
+      // Inference still works on the main thread (UI freezes during runs) —
+      // strictly better than failing outright.
+      console.warn("ort proxy worker 不可用，降级为主线程推理：", err && err.message ? err.message : err);
+      await boot(false, "v=1&noproxy", bufs);
+    }
     _onProgress("");
     return _sessions;
   })();
@@ -175,143 +235,15 @@ function detPreprocess(source, W, H, limit) {
     data[plane + p] = (g / 255 - DET_MEAN[1]) / DET_STD[1];
     data[2 * plane + p] = (r / 255 - DET_MEAN[2]) / DET_STD[2];
   }
-  return { tensor: new ort.Tensor("float32", data, [1, 3, nh, nw]), nw, nh };
+  return { tensor: new _ort.Tensor("float32", data, [1, 3, nh, nw]), nw, nh };
 }
 
-// ---------- geometry ----------
-// Andrew monotone chain convex hull. Input/output: [[x,y], ...].
-function convexHull(points) {
-  const pts = points.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-  if (pts.length <= 2) return pts;
-  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
-  const lower = [];
-  for (const p of pts) {
-    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
-    lower.push(p);
-  }
-  const upper = [];
-  for (let i = pts.length - 1; i >= 0; i--) {
-    const p = pts[i];
-    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
-    upper.push(p);
-  }
-  lower.pop();
-  upper.pop();
-  return lower.concat(upper);
-}
-
-// Rotating calipers: smallest-area oriented rectangle enclosing the hull.
-// Returns 4 corners (consistent winding, arbitrary start).
-function minAreaRect(hull) {
-  if (hull.length === 1) return [hull[0], hull[0], hull[0], hull[0]];
-  if (hull.length === 2) return [hull[0], hull[1], hull[1], hull[0]];
-  let best = null;
-  for (let i = 0; i < hull.length; i++) {
-    const [x1, y1] = hull[i];
-    const [x2, y2] = hull[(i + 1) % hull.length];
-    const len = Math.hypot(x2 - x1, y2 - y1);
-    if (!len) continue;
-    const ux = (x2 - x1) / len, uy = (y2 - y1) / len;
-    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
-    for (const [px, py] of hull) {
-      const u = px * ux + py * uy;
-      const v = py * ux - px * uy; // projection on the perpendicular (-uy, ux)
-      if (u < minU) minU = u;
-      if (u > maxU) maxU = u;
-      if (v < minV) minV = v;
-      if (v > maxV) maxV = v;
-    }
-    const area = (maxU - minU) * (maxV - minV);
-    if (!best || area < best.area) best = { area, ux, uy, minU, maxU, minV, maxV };
-  }
-  const { ux, uy, minU, maxU, minV, maxV } = best;
-  const corner = (u, v) => [u * ux - v * uy, u * uy + v * ux];
-  return [corner(minU, minV), corner(maxU, minV), corner(maxU, maxV), corner(minU, maxV)];
-}
-
-// PaddleOCR get_mini_boxes ordering: [tl, tr, br, bl], tl→tr = reading axis.
-function orderCorners(rect) {
-  const pts = rect.slice().sort((a, b) => a[0] - b[0]);
-  const tl = pts[0][1] <= pts[1][1] ? pts[0] : pts[1];
-  const bl = pts[0][1] <= pts[1][1] ? pts[1] : pts[0];
-  const tr = pts[2][1] <= pts[3][1] ? pts[2] : pts[3];
-  const br = pts[2][1] <= pts[3][1] ? pts[3] : pts[2];
-  return [tl, tr, br, bl];
-}
-
-// DB post-process, mirroring PaddleOCR DBPostProcess: connected components on
-// the binarized prob map -> convex hull -> min-area rect -> unclip expansion.
-// Returns [{poly, box, score}] in ORIGINAL px; poly is [tl,tr,br,bl], box is
-// the axis-aligned [x0,y0,x1,y1] envelope used by the fine-tune editor.
-function dbPostprocess(prob, mh, mw, sx, sy, W, H) {
-  const bin = new Uint8Array(mh * mw);
-  for (let i = 0; i < bin.length; i++) bin[i] = prob[i] > DET_THRESH ? 1 : 0;
-  const visited = new Uint8Array(mh * mw);
-  const stack = new Int32Array(mh * mw);
-  // per-row extremes of the current component; enough for its convex hull
-  const rowMin = new Int32Array(mh).fill(-1);
-  const rowMax = new Int32Array(mh);
-  const rows = [];
-  const out = [];
-  for (let start = 0; start < bin.length; start++) {
-    if (!bin[start] || visited[start]) continue;
-    let sp = 0;
-    stack[sp++] = start;
-    visited[start] = 1;
-    let sum = 0, cnt = 0;
-    rows.length = 0;
-    while (sp > 0) {
-      const idx = stack[--sp];
-      const x = idx % mw, y = (idx - x) / mw;
-      sum += prob[idx];
-      cnt++;
-      if (rowMin[y] < 0) { rowMin[y] = x; rowMax[y] = x; rows.push(y); }
-      else if (x < rowMin[y]) rowMin[y] = x;
-      else if (x > rowMax[y]) rowMax[y] = x;
-      if (x + 1 < mw && bin[idx + 1] && !visited[idx + 1]) { visited[idx + 1] = 1; stack[sp++] = idx + 1; }
-      if (x - 1 >= 0 && bin[idx - 1] && !visited[idx - 1]) { visited[idx - 1] = 1; stack[sp++] = idx - 1; }
-      if (y + 1 < mh && bin[idx + mw] && !visited[idx + mw]) { visited[idx + mw] = 1; stack[sp++] = idx + mw; }
-      if (y - 1 >= 0 && bin[idx - mw] && !visited[idx - mw]) { visited[idx - mw] = 1; stack[sp++] = idx - mw; }
-    }
-    const score = sum / cnt;
-    const pts = [];
-    for (const y of rows) {
-      pts.push([rowMin[y], y], [rowMax[y], y]);
-      rowMin[y] = -1;
-    }
-    if (score < DET_BOX_THRESH) continue;
-    const rect = orderCorners(minAreaRect(convexHull(pts)));
-    const w = Math.hypot(rect[1][0] - rect[0][0], rect[1][1] - rect[0][1]);
-    const h = Math.hypot(rect[3][0] - rect[0][0], rect[3][1] - rect[0][1]);
-    if (Math.min(w, h) < DET_MIN_SIZE) continue;
-    // unclip: offset each side outward by area*ratio/perimeter (Vatti offset
-    // of a rectangle == growing both half-extents by d)
-    const d = (w * h * DET_UNCLIP) / (2 * (w + h));
-    const cx = (rect[0][0] + rect[2][0]) / 2;
-    const cy = (rect[0][1] + rect[2][1]) / 2;
-    const ux = (rect[1][0] - rect[0][0]) / w, uy = (rect[1][1] - rect[0][1]) / w;
-    const vx = (rect[3][0] - rect[0][0]) / h, vy = (rect[3][1] - rect[0][1]) / h;
-    const hw = w / 2 + d, hh = h / 2 + d;
-    let poly = [
-      [cx - ux * hw - vx * hh, cy - uy * hw - vy * hh],
-      [cx + ux * hw - vx * hh, cy + uy * hw - vy * hh],
-      [cx + ux * hw + vx * hh, cy + uy * hw + vy * hh],
-      [cx - ux * hw + vx * hh, cy - uy * hw + vy * hh],
-    ];
-    // map-space -> original px, clamped to the image
-    poly = poly.map(([x, y]) => [
-      Math.max(0, Math.min(x * sx, W)),
-      Math.max(0, Math.min(y * sy, H)),
-    ]);
-    const xs = poly.map((p) => p[0]);
-    const ys = poly.map((p) => p[1]);
-    out.push({
-      poly,
-      box: [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)],
-      score,
-    });
-  }
-  return out;
+async function runDet(source, W, H, limit) {
+  const { tensor, nw, nh } = detPreprocess(source, W, H, limit);
+  const detOut = await runSession(_sessions.det, tensor);
+  const probT = detOut[_sessions.det.outputNames[0]];
+  const [, , mh, mw] = probT.dims;
+  return { probT, mh, mw, nw, nh };
 }
 
 // ---------- rotated line crop ----------
@@ -389,7 +321,7 @@ async function clsFlags(lines) {
           data[base + 2 * plane + p] = (rgba[i + 2] / 255 - DET_MEAN[2]) / DET_STD[2];
         }
       });
-      const out = await runSession(_sessions.cls, new ort.Tensor("float32", data, [n, 3, CLS_H, CLS_W]));
+      const out = await runSession(_sessions.cls, new _ort.Tensor("float32", data, [n, 3, CLS_H, CLS_W]));
       const o = out[_sessions.cls.outputNames[0]].data; // [n,2] softmax ['0','180']
       idxs.forEach((lineIdx, j) => {
         const p0 = o[j * 2], p180 = o[j * 2 + 1];
@@ -404,27 +336,6 @@ async function clsFlags(lines) {
     }
   }
   return flags;
-}
-
-function ctcDecode(probs, base, T, C) {
-  let prev = -1;
-  let text = "";
-  let scoreSum = 0, scoreN = 0;
-  for (let t = 0; t < T; t++) {
-    const off = base + t * C;
-    let best = 0, bestVal = probs[off];
-    for (let c = 1; c < C; c++) {
-      const v = probs[off + c];
-      if (v > bestVal) { bestVal = v; best = c; }
-    }
-    if (best !== prev && best !== 0) {
-      text += _classes[best];
-      scoreSum += bestVal; // rec output is already softmax prob -> use directly
-      scoreN++;
-    }
-    prev = best;
-  }
-  return { text, score: scoreN ? scoreSum / scoreN : 0 };
 }
 
 // Recognize every poly of `source` in one pass: crop+resize all lines, batch
@@ -476,12 +387,12 @@ async function recognizeLines(source, polys) {
       });
       const out = await runSession(
         _sessions.rec,
-        new ort.Tensor("float32", data, [idxs.length, 3, REC_H, maxW]),
+        new _ort.Tensor("float32", data, [idxs.length, 3, REC_H, maxW]),
       );
       const o = out[_sessions.rec.outputNames[0]];
       const [, T, C] = o.dims; // [n, T, 18385]
       idxs.forEach((lineIdx, j) => {
-        results[lineIdx] = ctcDecode(o.data, j * T * C, T, C);
+        results[lineIdx] = ctcDecode(o.data, j * T * C, T, C, _classes);
       });
     };
     try {
@@ -498,19 +409,9 @@ async function recognizeLines(source, polys) {
 }
 
 // ---------- public API ----------
-function rectPoly(b) {
-  return [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
-}
-
-function sortReadingOrder(entries) {
-  entries.sort(
-    (a, b) => (Math.round(a.box[1] / 10) - Math.round(b.box[1] / 10)) || a.box[0] - b.box[0],
-  );
-}
-
 // Detect + recognize a full image. `source` is an HTMLImageElement / canvas;
 // W,H are its natural (original) pixel size.
-async function recognizeFull(source, W, H, opts = {}) {
+export async function recognizeFull(source, W, H, opts = {}) {
   await init();
   const detLimit = +opts.detLimit || DET_LIMIT_DEFAULT;
   const t0 = performance.now();
@@ -547,13 +448,10 @@ async function recognizeFull(source, W, H, opts = {}) {
 
 // Recognize one pre-cropped region (fine-tune feature): det+rec inside it,
 // join lines in reading order.
-async function recognizeRegion(source, W, H) {
+export async function recognizeRegion(source, W, H) {
   await init();
   const t0 = performance.now();
-  const { tensor, nw, nh } = detPreprocess(source, W, H, DET_LIMIT_DEFAULT);
-  const detOut = await runSession(_sessions.det, tensor);
-  const probT = detOut[_sessions.det.outputNames[0]];
-  const [, , mh, mw] = probT.dims;
+  const { probT, mh, mw, nw, nh } = await runDet(source, W, H, DET_LIMIT_DEFAULT);
   let found = dbPostprocess(probT.data, mh, mw, W / nw, H / nh, W, H);
   // if detection finds nothing in a hand-drawn region, fall back to the whole box
   if (!found.length) found = [{ poly: rectPoly([0, 0, W, H]), box: [0, 0, W, H], score: 1 }];
@@ -569,10 +467,10 @@ async function recognizeRegion(source, W, H) {
 
 const round1 = (x) => Math.round(x * 10) / 10;
 
-window.LocalOCR = {
-  init,
-  recognizeFull,
-  recognizeRegion,
-  isReady: () => !!_sessions,
-  onProgress: (cb) => { _onProgress = cb || (() => {}); },
-};
+export function isReady() {
+  return !!_sessions;
+}
+
+export function onProgress(cb) {
+  _onProgress = cb || (() => {});
+}

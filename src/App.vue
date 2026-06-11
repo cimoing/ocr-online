@@ -21,13 +21,18 @@
       </select>
       <button class="btn primary" type="button" :disabled="busy || !currentBlob" @click="recognize">识别</button>
       <button class="btn" type="button" :disabled="!hasItems" @click="copyAll">复制全部</button>
+      <button class="btn" type="button" :disabled="!hasItems" title="下载识别文本（按当前置信过滤）" @click="exportTxt">
+        导出TXT
+      </button>
+      <button class="btn" type="button" :disabled="!hasItems" title="下载含坐标与置信度的结构化结果" @click="exportJson">
+        导出JSON
+      </button>
       <button
         class="btn"
         type="button"
         :disabled="!hasItems"
         title="按住时隐藏识别文字、显示原图，松开恢复，用于对比"
-        @mousedown="startPeek"
-        @touchstart.prevent="startPeek"
+        @pointerdown.prevent="startPeek"
       >
         按住对比原图
       </button>
@@ -74,7 +79,7 @@
         :class="{ peek, edit: editMode }"
         :style="{ '--mask': String(mask / 100) }"
         @click="onOverlayClick"
-        @mousedown="onOverlayMouseDown"
+        @pointerdown="onOverlayPointerDown"
         @mouseover="onOverlayMouseOver"
         @mousemove="onOverlayMouseMove"
         @mouseout="onOverlayMouseOut"
@@ -145,14 +150,12 @@
 
 <script>
 import { nextTick } from "vue";
+import * as ocr from "./ocr/engine.js";
+import { normRect, rectPoly } from "./ocr/geometry.js";
 
 const HANDLE_DIRS = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
 const MIN_BOX = 4;
 const DRAG_THRESHOLD = 3;
-
-function rectPoly(b) {
-  return [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
-}
 
 function fmtMs(ms) {
   if (ms == null || Number.isNaN(ms)) return "—";
@@ -186,8 +189,8 @@ export default {
       recognizingId: null,
       scoreTip: { visible: false, text: "", left: 0, top: 0 },
       handleDirs: HANDLE_DIRS,
-      ocrModulePromise: null,
       resizeTimer: null,
+      currentName: "",
     };
   },
   computed: {
@@ -213,16 +216,16 @@ export default {
   mounted() {
     window.addEventListener("paste", this.onPaste);
     window.addEventListener("resize", this.onResize);
-    window.addEventListener("mouseup", this.endPeek);
-    window.addEventListener("touchend", this.endPeek);
+    window.addEventListener("pointerup", this.endPeek);
+    window.addEventListener("pointercancel", this.endPeek);
     window.addEventListener("blur", this.endPeek);
     window.addEventListener("keydown", this.onKeyDown);
   },
   beforeUnmount() {
     window.removeEventListener("paste", this.onPaste);
     window.removeEventListener("resize", this.onResize);
-    window.removeEventListener("mouseup", this.endPeek);
-    window.removeEventListener("touchend", this.endPeek);
+    window.removeEventListener("pointerup", this.endPeek);
+    window.removeEventListener("pointercancel", this.endPeek);
     window.removeEventListener("blur", this.endPeek);
     window.removeEventListener("keydown", this.onKeyDown);
     if (this.currentURL) URL.revokeObjectURL(this.currentURL);
@@ -259,6 +262,7 @@ export default {
       if (this.currentURL) URL.revokeObjectURL(this.currentURL);
       this.currentBlob = blob;
       this.currentURL = URL.createObjectURL(blob);
+      this.currentName = (blob.name || "").replace(/\.[^.]+$/, "") || "ocr";
       this.current = null;
       this.timingChips = [];
       this.editMode = false;
@@ -284,34 +288,6 @@ export default {
       this.hideTip();
       this.setStatus("就绪 — 等待图片");
     },
-    async loadLocalOCR() {
-      if (!this.ocrModulePromise) {
-        this.ocrModulePromise = new Promise((resolve, reject) => {
-          if (window.LocalOCR) {
-            resolve();
-            return;
-          }
-
-          const existing = document.querySelector('script[data-ocr-local="true"]');
-          if (existing) {
-            existing.addEventListener("load", resolve, { once: true });
-            existing.addEventListener("error", () => reject(new Error("本地推理模块加载失败")), { once: true });
-            return;
-          }
-
-          const script = document.createElement("script");
-          script.type = "module";
-          script.src = `${import.meta.env.BASE_URL}ocr-local.js?v=4`;
-          script.dataset.ocrLocal = "true";
-          script.addEventListener("load", resolve, { once: true });
-          script.addEventListener("error", () => reject(new Error("本地推理模块加载失败")), { once: true });
-          document.head.appendChild(script);
-        });
-      }
-      await this.ocrModulePromise;
-      if (!window.LocalOCR) throw new Error("本地推理模块未加载，请刷新页面");
-      return window.LocalOCR;
-    },
     ensureItemIds(items) {
       for (const item of items) {
         if (item.id == null) item.id = this.nextId++;
@@ -325,11 +301,10 @@ export default {
       this.setStatus("识别中… 本地模型首次加载可能较慢");
       const tStart = performance.now();
       try {
-        const localOCR = await this.loadLocalOCR();
-        localOCR.onProgress((s) => {
+        ocr.onProgress((s) => {
           if (s) this.setStatus(`本地模型 · ${s}`);
         });
-        const data = await localOCR.recognizeFull(img, img.naturalWidth, img.naturalHeight, {
+        const data = await ocr.recognizeFull(img, img.naturalWidth, img.naturalHeight, {
           detLimit: this.detLimit,
         });
         data.model = "local";
@@ -429,6 +404,35 @@ export default {
       await this.copyText(this.visibleItems.map((i) => i.text).join("\n"));
       this.showToast(`已复制 ${this.visibleItems.length} 行`);
     },
+    downloadBlob(name, blob) {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    },
+    exportTxt() {
+      if (!this.hasItems) return;
+      const text = this.visibleItems.map((i) => i.text).join("\n");
+      this.downloadBlob(
+        `${this.currentName}.txt`,
+        new Blob([text], { type: "text/plain;charset=utf-8" }),
+      );
+      this.showToast(`已导出 ${this.visibleItems.length} 行`);
+    },
+    exportJson() {
+      if (!this.hasItems) return;
+      const payload = {
+        width: this.current.width,
+        height: this.current.height,
+        items: this.visibleItems.map(({ text, score, box, poly }) => ({ text, score, box, poly })),
+      };
+      this.downloadBlob(
+        `${this.currentName}.json`,
+        new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }),
+      );
+      this.showToast("已导出 JSON");
+    },
     onOverlayClick(e) {
       if (this.editMode) {
         const del = e.target.closest(".del-btn");
@@ -487,17 +491,7 @@ export default {
       return this.items.find((it) => String(it.id) === String(id));
     },
     normRect(x0, y0, x1, y1) {
-      let a = Math.min(x0, x1);
-      let b = Math.min(y0, y1);
-      let c = Math.max(x0, x1);
-      let d = Math.max(y0, y1);
-      const W = this.current.width;
-      const H = this.current.height;
-      a = Math.max(0, Math.min(a, W - MIN_BOX));
-      b = Math.max(0, Math.min(b, H - MIN_BOX));
-      c = Math.min(W, Math.max(c, a + MIN_BOX));
-      d = Math.min(H, Math.max(d, b + MIN_BOX));
-      return [a, b, c, d];
+      return normRect(x0, y0, x1, y1, this.current.width, this.current.height, MIN_BOX);
     },
     toggleEdit() {
       this.editMode = !this.editMode;
@@ -520,8 +514,8 @@ export default {
       if (String(this.selectedId) === String(id)) this.selectedId = null;
       this.showToast("已删除该区域");
     },
-    onOverlayMouseDown(e) {
-      if (!this.editMode || e.button !== 0) return;
+    onOverlayPointerDown(e) {
+      if (!this.editMode || !e.isPrimary || (e.pointerType === "mouse" && e.button !== 0)) return;
       if (e.target.closest(".del-btn")) return;
       const handle = e.target.closest(".handle");
       const box = e.target.closest(".ocr-box");
@@ -529,18 +523,22 @@ export default {
       else if (box) this.startMove(e, box);
       else if (e.target === this.$refs.overlay) this.startDraw(e);
     },
+    // pointer events instead of mouse events so drag/resize/draw also work on
+    // touch screens (touch-action:none on the overlay stops page panning)
     beginGesture(onMove, onUp) {
       this.dragging = true;
       this.hideTip();
       const move = (ev) => onMove(ev);
-      const up = (ev) => {
-        window.removeEventListener("mousemove", move);
-        window.removeEventListener("mouseup", up);
+      const finish = (ev) => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
         this.dragging = false;
         onUp(ev);
       };
-      window.addEventListener("mousemove", move);
-      window.addEventListener("mouseup", up);
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
     },
     startResize(e, boxEl, dir) {
       e.preventDefault();
@@ -644,9 +642,8 @@ export default {
       if (w < 2 || h < 2) return;
       this.recognizingId = item.id;
       try {
-        const localOCR = await this.loadLocalOCR();
         const c = this.cropCanvas(x0, y0, w, h);
-        const data = await localOCR.recognizeRegion(c, c.width, c.height);
+        const data = await ocr.recognizeRegion(c, c.width, c.height);
         item.text = data.text || "";
         item.score = data.score;
         item.pinned = true; // user-adjusted region: never hide behind the slider

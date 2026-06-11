@@ -295,6 +295,8 @@ body {
   justify-content: space-between;
   gap: 12px;
 }
+/* editing must own the gesture on touch screens (no page pan/zoom) */
+.overlay.edit, .overlay.edit * { touch-action: none; }
 .bar-row .status { flex: 1; min-width: 0; }
 .status.err { color: #dc2626; }
 .hidden-note { color: #b45309; font-size: 12px; white-space: nowrap; }
