@@ -25,6 +25,7 @@ ppocr/
 ├── vite.config.js           # preview 模式带 COOP/COEP/CORP 头
 ├── src/
 │   ├── main.js
+│   ├── style.css            # 全局样式（经 Vite 打包注入）
 │   ├── App.vue              # UI：叠加渲染 / 复制导出 / 微调编辑
 │   └── ocr/
 │       ├── engine.js        # ort 加载、模型 I/O、批量推理管线（DOM 侧）
@@ -33,7 +34,6 @@ ppocr/
 │       ├── ctc.js           # CTC 解码（纯函数）
 │       └── *.test.js        # vitest 单测
 ├── static/                  # Vite public 目录，原样复制进 dist/
-│   ├── style.css
 │   ├── coi-serviceworker.min.js  # GitHub Pages 上注入 COOP/COEP 启用多线程
 │   ├── models/              # det/rec/cls.onnx + ppocrv5_keys.txt
 │   └── vendor/ort/          # onnxruntime-web WASM 运行时
